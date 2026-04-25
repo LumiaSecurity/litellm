@@ -68,6 +68,7 @@ class SupportedGuardrailIntegrations(Enum):
     CROWDSTRIKE_AIDR = "crowdstrike_aidr"
     LASSO = "lasso"
     PILLAR = "pillar"
+    LUMIA = "lumia"
     GRAYSWAN = "grayswan"
     PANW_PRISMA_AIRS = "panw_prisma_airs"
     AZURE_PROMPT_SHIELD = "azure/prompt_shield"
