@@ -207,29 +207,31 @@ def test_init_invalid_fallback_falls_back_to_default(env_setup):
 # =============================================================================
 
 
-def test_extract_identity_with_full_context(
+def test_extract_request_data_with_full_context(
     lumia_guardrail, user_api_key_dict_full, sample_request_data
 ):
-    identity = lumia_guardrail._extract_identity(
+    request_data = lumia_guardrail._extract_request_data(
         user_api_key_dict_full, sample_request_data
     )
-    assert identity["user_id"] == "jane-user-id"
-    assert identity["user_email"] == "jane@company.com"
-    assert identity["team_id"] == "team-123"
-    assert identity["team_alias"] == "engineering"
-    assert identity["org_id"] == "org-456"
-    assert identity["end_user_id"] == "end-user-789"
-    assert identity["key_alias"] == "prod-alias"
-    assert identity["user_field"] == "user-from-data"
+    assert request_data["user_api_key_user_id"] == "jane-user-id"
+    assert request_data["user_api_key_user_email"] == "jane@company.com"
+    assert request_data["user_api_key_team_id"] == "team-123"
+    assert request_data["user_api_key_team_alias"] == "engineering"
+    assert request_data["user_api_key_org_id"] == "org-456"
+    assert request_data["user_api_key_end_user_id"] == "end-user-789"
+    assert request_data["user_api_key_alias"] == "prod-alias"
+    assert request_data["user"] == "user-from-data"
 
 
-def test_extract_identity_with_empty_context(
+def test_extract_request_data_with_empty_context(
     lumia_guardrail, user_api_key_dict, sample_request_data
 ):
-    identity = lumia_guardrail._extract_identity(user_api_key_dict, sample_request_data)
-    # The fields should exist but be None or the user_field from data
-    assert identity["user_id"] is None
-    assert identity["user_field"] == "user-from-data"
+    request_data = lumia_guardrail._extract_request_data(
+        user_api_key_dict, sample_request_data
+    )
+    # Fields should exist but be None when user_api_key_dict has no values set
+    assert request_data["user_api_key_user_id"] is None
+    assert request_data["user"] == "user-from-data"
 
 
 # =============================================================================
@@ -490,16 +492,29 @@ async def test_payload_includes_all_expected_fields(
         )
 
     payload = captured["json"]
-    assert payload["input_type"] == "request"
-    assert payload["call_type"] == "completion"
+
+    # Body fields preserved at the top level (matches what per-vendor
+    # protocol definitions on the receiving side parse natively).
     assert payload["model"] == "gpt-4o-mini"
+    assert payload["messages"] == sample_request_data["messages"]
     assert payload["api_base"] == "https://api.openai.com/v1"
-    assert payload["structured_messages"] == sample_request_data["messages"]
-    assert payload["identity"]["user_id"] == "jane-user-id"
-    assert payload["identity"]["end_user_id"] == "end-user-789"
-    assert payload["request_headers"]["user-agent"] == "Cursor/0.50.16"
-    assert payload["litellm_call_id"] == "call-abc-123"
-    assert payload["litellm_trace_id"] == "trace-xyz-789"
+
+    # LiteLLM-internal/bookkeeping fields are stripped from the body.
+    assert "litellm_call_id" not in payload
+    assert "litellm_trace_id" not in payload
+    assert "metadata" not in payload
+
+    # Lumia-specific metadata grouped under the _litellm envelope.
+    envelope = payload["_litellm"]
+    assert envelope["input_type"] == "request"
+    assert envelope["call_type"] == "completion"
+    assert envelope["api_base"] == "https://api.openai.com/v1"
+    assert envelope["request_data"]["user_api_key_user_id"] == "jane-user-id"
+    assert envelope["request_data"]["user_api_key_end_user_id"] == "end-user-789"
+    assert envelope["request_headers"]["user-agent"] == "Cursor/0.50.16"
+    assert envelope["litellm_call_id"] == "call-abc-123"
+    assert envelope["litellm_trace_id"] == "trace-xyz-789"
+
     assert captured["headers"]["x-api-key"] == "test-lumia-token"
 
 

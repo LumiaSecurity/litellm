@@ -41,6 +41,25 @@ class LumiaGuardrailAPIError(Exception):
     pass
 
 
+# Fields that exist in the LiteLLM hook ``data`` dict but are LiteLLM-internal
+# bookkeeping rather than parts of the original LLM API request body. These
+# are stripped before forwarding so the body that arrives at the Lumia API
+# matches what the upstream provider would see, plus a ``_litellm`` envelope
+# that carries Lumia-specific metadata.
+_EXCLUDE_FROM_BODY = frozenset(
+    {
+        "litellm_call_id",
+        "litellm_trace_id",
+        "litellm_metadata",
+        "litellm_logging_obj",
+        "metadata",
+        "proxy_server_request",
+        "provider_specific_header",
+        "secret_fields",
+    }
+)
+
+
 class LumiaGuardrail(CustomGuardrail):
     """
     Lumia Security guardrail integration for LiteLLM.
@@ -220,46 +239,53 @@ class LumiaGuardrail(CustomGuardrail):
         """
         Build the JSON payload sent to the Lumia API.
 
-        Uses natural LiteLLM payload shape (``structured_messages``,
-        ``litellm_call_id``, ``litellm_trace_id``, ``model``, ``tools``, etc.)
-        so the Lumia parser can process traffic from any underlying LLM
-        provider routed through LiteLLM uniformly, without per-provider
-        translation.
+        Preserves the original LLM API request body (``messages`` for
+        chat-completions, ``input`` for the Responses API, plus provider-
+        specific fields like Anthropic's ``system``, ``thinking``,
+        ``context_management``, etc.) at the top level so per-vendor protocol
+        definitions on the receiving side can parse them natively.
+
+        Lumia-specific metadata (identity, headers, LiteLLM call/trace IDs)
+        is grouped under a single ``_litellm`` envelope to keep it cleanly
+        separated from the upstream body.
         """
-        payload: Dict[str, Any] = {
+        body = {k: v for k, v in data.items() if k not in _EXCLUDE_FROM_BODY}
+
+        payload: Dict[str, Any] = dict(body)
+        payload["_litellm"] = {
             "input_type": input_type,
             "call_type": call_type,
-            "model": data.get("model"),
             "api_base": data.get("api_base"),
-            "structured_messages": data.get("messages"),
-            "tools": data.get("tools"),
-            "tool_calls": data.get("tool_calls"),
-            "identity": self._extract_identity(user_api_key_dict, data),
+            "request_data": self._extract_request_data(user_api_key_dict, data),
             "request_headers": self._extract_headers(data),
             "litellm_call_id": data.get("litellm_call_id"),
             "litellm_trace_id": data.get("litellm_trace_id"),
             "litellm_version": litellm_version,
         }
-
         if response is not None:
-            payload["response"] = response
+            payload["_litellm"]["response"] = response
 
         return payload
 
-    def _extract_identity(
+    def _extract_request_data(
         self, user_api_key_dict: UserAPIKeyAuth, data: dict
     ) -> Dict[str, Optional[str]]:
-        """Extract all identity fields available from the LiteLLM hook context."""
+        """
+        Extract user/key context from the LiteLLM hook in the standard
+        ``request_data`` shape with ``user_api_key_*`` prefixes (matches the
+        convention used by LiteLLM's Generic Guardrail API and downstream
+        consumers in the LiteLLM ecosystem).
+        """
         return {
-            "user_id": getattr(user_api_key_dict, "user_id", None),
-            "user_email": getattr(user_api_key_dict, "user_email", None),
-            "team_id": getattr(user_api_key_dict, "team_id", None),
-            "team_alias": getattr(user_api_key_dict, "team_alias", None),
-            "org_id": getattr(user_api_key_dict, "org_id", None),
-            "end_user_id": getattr(user_api_key_dict, "end_user_id", None),
-            "key_alias": getattr(user_api_key_dict, "key_alias", None),
-            "key_name": getattr(user_api_key_dict, "key_name", None),
-            "user_field": data.get("user"),
+            "user_api_key_hash": getattr(user_api_key_dict, "api_key", None),
+            "user_api_key_alias": getattr(user_api_key_dict, "key_alias", None),
+            "user_api_key_user_id": getattr(user_api_key_dict, "user_id", None),
+            "user_api_key_user_email": getattr(user_api_key_dict, "user_email", None),
+            "user_api_key_team_id": getattr(user_api_key_dict, "team_id", None),
+            "user_api_key_team_alias": getattr(user_api_key_dict, "team_alias", None),
+            "user_api_key_end_user_id": getattr(user_api_key_dict, "end_user_id", None),
+            "user_api_key_org_id": getattr(user_api_key_dict, "org_id", None),
+            "user": data.get("user"),
         }
 
     def _extract_headers(self, data: dict) -> Dict[str, str]:
