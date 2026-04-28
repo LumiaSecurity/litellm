@@ -278,7 +278,7 @@ async def test_pre_call_hook_allow(
 async def test_pre_call_hook_blocked(
     lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
 ):
-    """When Lumia returns BLOCKED, an HTTPException should be raised."""
+    """When Lumia returns BLOCKED, an HTTPException(451) should be raised."""
     blocked_response = _http_response(
         {"action": "BLOCKED", "blocked_reason": "Policy violation"}
     )
@@ -294,7 +294,7 @@ async def test_pre_call_hook_blocked(
                 data=sample_request_data,
                 call_type="completion",
             )
-    assert exc_info.value.status_code == 400
+    assert exc_info.value.status_code == 451
     assert "Policy violation" in str(exc_info.value.detail)
 
 
@@ -380,7 +380,7 @@ async def test_pre_call_hook_fail_open_on_unreachable(
 async def test_pre_call_hook_fail_closed_on_unreachable(
     lumia_fail_closed, user_api_key_dict, dual_cache, sample_request_data
 ):
-    """fail_closed: connection errors must raise HTTPException(503)."""
+    """fail_closed: connection errors must raise HTTPException(451)."""
     with patch.object(
         lumia_fail_closed.async_handler,
         "post",
@@ -393,7 +393,8 @@ async def test_pre_call_hook_fail_closed_on_unreachable(
                 data=sample_request_data,
                 call_type="completion",
             )
-    assert exc_info.value.status_code == 503
+    assert exc_info.value.status_code == 451
+    assert "fail policy" in str(exc_info.value.detail).lower()
 
 
 @pytest.mark.asyncio
@@ -477,9 +478,9 @@ async def test_payload_includes_all_expected_fields(
     """Verify the payload sent to Lumia contains all expected sections."""
     captured = {}
 
-    async def fake_post(url, json, headers, timeout):
+    async def fake_post(url, content, headers, timeout):
         captured["url"] = url
-        captured["json"] = json
+        captured["content"] = content
         captured["headers"] = headers
         return _http_response({"action": "NONE"})
 
@@ -491,7 +492,9 @@ async def test_payload_includes_all_expected_fields(
             call_type="completion",
         )
 
-    payload = captured["json"]
+    import json as _json
+
+    payload = _json.loads(captured["content"])
 
     # Body fields preserved at the top level (matches what per-vendor
     # protocol definitions on the receiving side parse natively).

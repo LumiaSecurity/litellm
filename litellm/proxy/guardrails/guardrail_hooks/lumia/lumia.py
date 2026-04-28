@@ -52,6 +52,7 @@ _EXCLUDE_FROM_BODY = frozenset(
         "litellm_trace_id",
         "litellm_metadata",
         "litellm_logging_obj",
+        "litellm_params",
         "metadata",
         "proxy_server_request",
         "provider_specific_header",
@@ -249,10 +250,24 @@ class LumiaGuardrail(CustomGuardrail):
         is grouped under a single ``_litellm`` envelope to keep it cleanly
         separated from the upstream body.
         """
-        body = {k: v for k, v in data.items() if k not in _EXCLUDE_FROM_BODY}
+        request_body = {k: v for k, v in data.items() if k not in _EXCLUDE_FROM_BODY}
 
-        payload: Dict[str, Any] = dict(body)
-        payload["_litellm"] = {
+        # For response events the top-level payload is the LLM response so the
+        # parser's response-side dissectors (``choices[].message.content`` for
+        # OpenAI, ``content[].text`` for Anthropic, etc.) match against the
+        # right shape. The original request body is preserved under the
+        # ``_litellm`` envelope so downstream consumers can correlate the two
+        # without a separate lookup.
+        #
+        # For request events the original behaviour stands: top-level is the
+        # request body so per-vendor request-side dissectors (``messages``,
+        # ``system``, ``tools``, ``input``, etc.) match natively.
+        if input_type == "response" and response is not None:
+            payload: Dict[str, Any] = dict(response)
+        else:
+            payload = dict(request_body)
+
+        envelope: Dict[str, Any] = {
             "input_type": input_type,
             "call_type": call_type,
             "api_base": data.get("api_base"),
@@ -262,8 +277,9 @@ class LumiaGuardrail(CustomGuardrail):
             "litellm_trace_id": data.get("litellm_trace_id"),
             "litellm_version": litellm_version,
         }
-        if response is not None:
-            payload["_litellm"]["response"] = response
+        if input_type == "response":
+            envelope["request_body"] = request_body
+        payload["_litellm"] = envelope
 
         return payload
 
@@ -328,16 +344,25 @@ class LumiaGuardrail(CustomGuardrail):
         - ``raise_on_error=True`` and ``fail_open``   -> returns None (allow request)
         - ``raise_on_error=False`` (post_call)        -> returns None on any error
         """
+        import json
+
         url = f"{self.api_base}{self.GUARDRAIL_PATH}"
         headers = {
             "Content-Type": "application/json",
             "x-api-key": self.api_key or "",
         }
 
+        # Pre-serialize so we can pass ``default=str`` and survive any
+        # LiteLLM-internal objects (aiohttp ClientSession, custom callable
+        # references, etc.) that may slip through ``_EXCLUDE_FROM_BODY``.
+        # Without this, post-call payloads occasionally fail with
+        # ``Object of type ClientSession is not JSON serializable``.
+        body = json.dumps(payload, default=str)
+
         try:
             response = await self.async_handler.post(
                 url=url,
-                json=payload,
+                content=body,
                 headers=headers,
                 timeout=self.timeout,
             )
@@ -370,12 +395,22 @@ class LumiaGuardrail(CustomGuardrail):
             return self._handle_unreachable()
 
     def _handle_unreachable(self) -> Optional[Dict[str, Any]]:
-        """Apply the configured fallback when the Lumia API is unreachable."""
+        """
+        Apply the configured fallback when the Lumia API is unreachable.
+
+        For ``fail_closed`` we surface HTTP 451 ("Unavailable For Legal
+        Reasons" — also widely used for "blocked by policy / external
+        authority") rather than 503. Clients (Cursor, OpenAI SDK, etc.)
+        treat 5xx as transient and retry with backoff, which produces a
+        retry storm during a Lumia outage. A 4xx surfaces the block once
+        and stops; 451 is distinguishable from a real 400 BadRequest so
+        operators can grep for it in logs.
+        """
         if self.unreachable_fallback == "fail_closed":
             raise HTTPException(
-                status_code=503,
+                status_code=451,
                 detail={
-                    "error": "Lumia guardrail API is unreachable",
+                    "error": "you were blocked by Lumia guardrail's default fail policy",
                     "guardrail_name": self.guardrail_name,
                 },
             )
@@ -393,7 +428,9 @@ class LumiaGuardrail(CustomGuardrail):
         Apply Lumia's decision to the request data.
 
         Returns the (possibly mutated) data dict on allow / intervene.
-        Raises HTTPException(400) on block.
+        Raises ``GuardrailRaisedException`` on block (LiteLLM maps to
+        HTTP 400 — non-retriable, consistent with the rest of the
+        LiteLLM guardrail ecosystem).
         """
         if response is None:
             # fail_open path - allow through unchanged
@@ -412,7 +449,7 @@ class LumiaGuardrail(CustomGuardrail):
                 "Lumia Guardrail: blocking request - %s", blocked_reason
             )
             raise HTTPException(
-                status_code=400,
+                status_code=451,
                 detail={
                     "error": "Request blocked by Lumia guardrail",
                     "blocked_reason": blocked_reason,
@@ -421,10 +458,19 @@ class LumiaGuardrail(CustomGuardrail):
             )
 
         if action == "GUARDRAIL_INTERVENED":
+            modified_texts = response.get("texts") or []
+            modified_images = response.get("images") or []
+            verbose_proxy_logger.warning(
+                "Lumia Guardrail: applying intervention "
+                "(texts=%d, images=%d) — first text preview: %r",
+                len(modified_texts),
+                len(modified_images),
+                (modified_texts[0][:200] if modified_texts else None),
+            )
             return self._apply_intervention(
                 data=data,
-                modified_texts=response.get("texts"),
-                modified_images=response.get("images"),
+                modified_texts=modified_texts,
+                modified_images=modified_images,
             )
 
         verbose_proxy_logger.warning(
@@ -432,7 +478,7 @@ class LumiaGuardrail(CustomGuardrail):
         )
         return data
 
-    def _apply_intervention(
+    def _apply_intervention(  # noqa: PLR0915 - diagnostic logging makes this longer than the linter likes
         self,
         data: dict,
         modified_texts: Optional[List[str]],
@@ -443,17 +489,47 @@ class LumiaGuardrail(CustomGuardrail):
 
         Replaces text and image content blocks in the messages array in order,
         leaving the original message structure intact for any blocks that were
-        not modified.
+        not modified. Matches the per-block convention used by LiteLLM's
+        Generic Guardrail API and other LiteLLM-ecosystem guardrail vendors.
         """
         if not modified_texts and not modified_images:
+            verbose_proxy_logger.warning(
+                "Lumia Guardrail: intervention skipped — both texts and images empty"
+            )
             return data
 
         messages = data.get("messages")
         if not isinstance(messages, list):
+            verbose_proxy_logger.warning(
+                "Lumia Guardrail: intervention skipped — data['messages'] is not a list (got %s)",
+                type(messages).__name__,
+            )
             return data
+
+        # Snapshot before-state for diagnostic visibility.
+        first_block_before: Optional[str] = None
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str) and not first_block_before:
+                first_block_before = content[:200]
+                break
+            if isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ):
+                        first_block_before = block["text"][:200]
+                        break
+                if first_block_before:
+                    break
 
         text_iter = iter(modified_texts or [])
         image_iter = iter(modified_images or [])
+        texts_replaced = 0
+        images_replaced = 0
+        first_block_after: Optional[str] = None
 
         for message in messages:
             content = message.get("content")
@@ -462,6 +538,9 @@ class LumiaGuardrail(CustomGuardrail):
                 next_text = next(text_iter, None)
                 if next_text is not None:
                     message["content"] = next_text
+                    texts_replaced += 1
+                    if first_block_after is None:
+                        first_block_after = next_text[:200]
             elif isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
@@ -471,6 +550,9 @@ class LumiaGuardrail(CustomGuardrail):
                         next_text = next(text_iter, None)
                         if next_text is not None:
                             block["text"] = next_text
+                            texts_replaced += 1
+                            if first_block_after is None:
+                                first_block_after = next_text[:200]
                     elif block_type == "image_url":
                         next_image = next(image_iter, None)
                         if next_image is not None:
@@ -479,6 +561,20 @@ class LumiaGuardrail(CustomGuardrail):
                                 image_url["url"] = next_image
                             else:
                                 block["image_url"] = {"url": next_image}
+                            images_replaced += 1
+
+        verbose_proxy_logger.warning(
+            "Lumia Guardrail: intervention applied — texts replaced=%d/%d, "
+            "images replaced=%d/%d, messages count=%d. "
+            "First text block before=%r → after=%r",
+            texts_replaced,
+            len(modified_texts or []),
+            images_replaced,
+            len(modified_images or []),
+            len(messages),
+            first_block_before,
+            first_block_after,
+        )
 
         return data
 
