@@ -8,7 +8,6 @@ from litellm.types.guardrails import SupportedGuardrailIntegrations
 
 from .lumia import (
     LumiaGuardrail,
-    LumiaGuardrailAPIError,
     LumiaGuardrailMissingSecrets,
 )
 
@@ -48,6 +47,5 @@ guardrail_class_registry = {
 
 __all__ = [
     "LumiaGuardrail",
-    "LumiaGuardrailAPIError",
     "LumiaGuardrailMissingSecrets",
 ]

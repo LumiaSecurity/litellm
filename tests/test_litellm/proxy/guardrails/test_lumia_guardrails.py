@@ -1,15 +1,19 @@
 """
 Lumia Security Guardrail tests for LiteLLM.
 
-Tests cover initialization, hook execution, response mapping, identity
-extraction, header forwarding, and unreachable-fallback behavior. Follows
-LiteLLM testing patterns and uses mocked HTTP responses (no real network calls).
+The Lumia guardrail now uses LiteLLM's unified ``apply_guardrail`` interface.
+LiteLLM's per-endpoint translation handlers normalize provider-specific
+bodies into a single ``GenericGuardrailAPIInputs`` shape (texts, images,
+tool_calls, structured_messages) before calling our class, and they
+re-apply any modifications we return back into the original body. These
+tests therefore exercise the apply_guardrail path directly with already-
+normalized inputs.
 """
 
 import importlib
 import os
 import sys
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.abspath("../../.."))
 
@@ -18,8 +22,6 @@ from fastapi.exceptions import HTTPException
 from httpx import Request, Response
 
 import litellm
-from litellm import DualCache
-from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.lumia import (
     LumiaGuardrail,
     LumiaGuardrailMissingSecrets,
@@ -55,7 +57,6 @@ def setup_and_teardown():
 
 @pytest.fixture
 def env_setup(monkeypatch):
-    """Set environment variables for Lumia tests."""
     monkeypatch.setenv("LUMIA_GUARDRAIL_API_KEY", "test-lumia-token")
     monkeypatch.setenv("LUMIA_GUARDRAIL_API_BASE", "https://guardrails.test.lumia")
     yield
@@ -63,7 +64,6 @@ def env_setup(monkeypatch):
 
 @pytest.fixture
 def lumia_guardrail(env_setup):
-    """LumiaGuardrail instance with default config."""
     return LumiaGuardrail(
         guardrail_name="lumia-test",
         api_key="test-lumia-token",
@@ -73,7 +73,6 @@ def lumia_guardrail(env_setup):
 
 @pytest.fixture
 def lumia_fail_closed(env_setup):
-    """LumiaGuardrail instance configured to fail closed on errors."""
     return LumiaGuardrail(
         guardrail_name="lumia-test-fail-closed",
         api_key="test-lumia-token",
@@ -83,78 +82,46 @@ def lumia_fail_closed(env_setup):
 
 
 @pytest.fixture
-def user_api_key_dict():
-    """Empty UserAPIKeyAuth instance."""
-    return UserAPIKeyAuth()
-
-
-@pytest.fixture
-def user_api_key_dict_full():
-    """UserAPIKeyAuth instance populated with identity fields."""
-    return UserAPIKeyAuth(
-        token="hashed-token",
-        key_name="prod-key",
-        key_alias="prod-alias",
-        user_id="jane-user-id",
-        user_email="jane@company.com",
-        team_id="team-123",
-        team_alias="engineering",
-        org_id="org-456",
-        end_user_id="end-user-789",
-    )
-
-
-@pytest.fixture
-def dual_cache():
-    """DualCache instance."""
-    return DualCache()
+def sample_inputs():
+    """Inputs as LiteLLM's translation handler would pass them."""
+    return {
+        "texts": ["You are a helpful assistant.", "Hello, how are you?"],
+        "structured_messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello, how are you?"},
+        ],
+        "model": "gpt-4o-mini",
+    }
 
 
 @pytest.fixture
 def sample_request_data():
-    """Sample chat completion request data."""
+    """request_data dict as the translation handler would pass it."""
     return {
         "model": "gpt-4o-mini",
-        "api_base": "https://api.openai.com/v1",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello, how are you?"},
-        ],
-        "user": "user-from-data",
-        "litellm_call_id": "call-abc-123",
-        "litellm_trace_id": "trace-xyz-789",
+        "litellm_metadata": {
+            "user_api_key_user_id": "jane-user-id",
+            "user_api_key_user_email": "jane@company.com",
+            "user_api_key_team_id": "team-123",
+            "user_api_key_alias": "prod-alias",
+        },
         "metadata": {
             "headers": {
                 "user-agent": "Cursor/0.50.16",
                 "x-litellm-end-user-id": "end-user-from-header",
+                "authorization": "Bearer should-be-stripped",
+            }
+        },
+        "proxy_server_request": {
+            "headers": {
+                "user-agent": "Cursor/0.50.16",
+                "x-forwarded-for": "203.0.113.7",
             }
         },
     }
 
 
-@pytest.fixture
-def multimodal_request_data():
-    """Request data with multi-modal content (image, file)."""
-    return {
-        "model": "gpt-4o",
-        "api_base": "https://api.openai.com/v1",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What is in this image?"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAA=="},
-                    },
-                ],
-            }
-        ],
-    }
-
-
 def _http_response(json_body=None, status_code=200):
-    """Helper to build an httpx.Response object for mocking."""
     return Response(
         json=json_body if json_body is not None else {"action": "NONE"},
         status_code=status_code,
@@ -163,26 +130,23 @@ def _http_response(json_body=None, status_code=200):
 
 
 # =============================================================================
-# INITIALIZATION TESTS
+# INITIALIZATION
 # =============================================================================
 
 
 def test_init_requires_api_key(monkeypatch):
-    """Constructor must raise when no API key is supplied."""
     monkeypatch.delenv("LUMIA_GUARDRAIL_API_KEY", raising=False)
     with pytest.raises(LumiaGuardrailMissingSecrets):
         LumiaGuardrail(api_key=None, api_base="https://guardrails.test.lumia")
 
 
 def test_init_reads_api_key_from_env(monkeypatch):
-    """Constructor should pick up the API key from the environment."""
     monkeypatch.setenv("LUMIA_GUARDRAIL_API_KEY", "env-token")
     guardrail = LumiaGuardrail(api_key=None, api_base="https://guardrails.test.lumia")
     assert guardrail.api_key == "env-token"
 
 
 def test_init_strips_trailing_slash_from_api_base(env_setup):
-    """The api_base attribute should not contain a trailing slash."""
     guardrail = LumiaGuardrail(
         api_key="test-token", api_base="https://guardrails.test.lumia/"
     )
@@ -202,136 +166,162 @@ def test_init_invalid_fallback_falls_back_to_default(env_setup):
     assert guardrail.unreachable_fallback == "fail_open"
 
 
+def test_class_overrides_apply_guardrail():
+    """LiteLLM auto-routes to the unified path when ``apply_guardrail`` is
+    defined directly on the subclass. Make sure we keep that property —
+    if this assertion fails, traffic silently falls back to the legacy
+    pre_call path."""
+    assert "apply_guardrail" in LumiaGuardrail.__dict__
+
+
 # =============================================================================
-# IDENTITY EXTRACTION TESTS
+# IDENTITY EXTRACTION
 # =============================================================================
 
 
-def test_extract_request_data_with_full_context(
-    lumia_guardrail, user_api_key_dict_full, sample_request_data
+def test_slice_request_metadata_extracts_identity_and_headers(
+    lumia_guardrail, sample_request_data
 ):
-    request_data = lumia_guardrail._extract_request_data(
-        user_api_key_dict_full, sample_request_data
-    )
-    assert request_data["user_api_key_user_id"] == "jane-user-id"
-    assert request_data["user_api_key_user_email"] == "jane@company.com"
-    assert request_data["user_api_key_team_id"] == "team-123"
-    assert request_data["user_api_key_team_alias"] == "engineering"
-    assert request_data["user_api_key_org_id"] == "org-456"
-    assert request_data["user_api_key_end_user_id"] == "end-user-789"
-    assert request_data["user_api_key_alias"] == "prod-alias"
-    assert request_data["user"] == "user-from-data"
+    """Slice extracts ONLY user_api_key_* identity fields and headers.
+    Everything else is intentionally dropped to avoid cycles in the
+    accumulated post-call hook state."""
+    sliced = lumia_guardrail._slice_request_metadata(sample_request_data)
+    assert sliced["request_data"]["user_api_key_user_email"] == "jane@company.com"
+    assert sliced["request_data"]["user_api_key_user_id"] == "jane-user-id"
+    assert sliced["request_headers"]["user-agent"] == "Cursor/0.50.16"
+    assert sliced["request_headers"]["x-forwarded-for"] == "203.0.113.7"
+    # ``metadata`` / ``litellm_metadata`` / ``proxy_server_request`` are
+    # NOT forwarded as nested dicts — only the flat strings we care about.
+    assert "metadata" not in sliced
+    assert "litellm_metadata" not in sliced
+    assert "proxy_server_request" not in sliced
 
 
-def test_extract_request_data_with_empty_context(
-    lumia_guardrail, user_api_key_dict, sample_request_data
-):
-    request_data = lumia_guardrail._extract_request_data(
-        user_api_key_dict, sample_request_data
-    )
-    # Fields should exist but be None when user_api_key_dict has no values set
-    assert request_data["user_api_key_user_id"] is None
-    assert request_data["user"] == "user-from-data"
+def test_slice_request_metadata_survives_circular_references(lumia_guardrail):
+    """LiteLLM's accumulated post-call state may contain cycles
+    (``standard_logging_object`` → ``metadata`` → … → itself). The slice
+    must still produce a JSON-serializable payload by only copying flat
+    strings."""
+    import json as _json
+
+    cyclic_metadata: dict = {
+        "user_api_key_user_email": "cycle@test",
+        "user_api_key_user_id": "u-1",
+    }
+    cyclic_metadata["standard_logging_object"] = {"metadata": cyclic_metadata}
+
+    request_data = {"metadata": cyclic_metadata}
+    sliced = lumia_guardrail._slice_request_metadata(request_data)
+    # Must be JSON-serializable — the bug we're guarding against
+    _json.dumps(sliced)
+    assert sliced["request_data"]["user_api_key_user_email"] == "cycle@test"
+
+
+def test_slice_request_metadata_drops_non_serializable_keys(lumia_guardrail):
+    """``litellm_logging_obj`` and other non-serializable fields are
+    intentionally not forwarded — would break json.dumps."""
+
+    class _Unserializable:
+        pass
+
+    request_data = {
+        "metadata": {"user_api_key_user_id": "u-1"},
+        "litellm_logging_obj": _Unserializable(),
+        "litellm_params": _Unserializable(),
+        "secret_fields": ["api_key"],
+    }
+    sliced = lumia_guardrail._slice_request_metadata(request_data)
+    assert sliced == {"request_data": {"user_api_key_user_id": "u-1"}}
+
+
+def test_slice_request_metadata_with_no_context(lumia_guardrail):
+    assert lumia_guardrail._slice_request_metadata({}) == {}
 
 
 # =============================================================================
-# HEADER EXTRACTION TESTS
-# =============================================================================
-
-
-def test_extract_headers_from_metadata(lumia_guardrail, sample_request_data):
-    headers = lumia_guardrail._extract_headers(sample_request_data)
-    assert headers["user-agent"] == "Cursor/0.50.16"
-    assert headers["x-litellm-end-user-id"] == "end-user-from-header"
-
-
-def test_extract_headers_with_no_metadata(lumia_guardrail):
-    headers = lumia_guardrail._extract_headers({"model": "gpt-4o"})
-    assert headers == {}
-
-
-# =============================================================================
-# PRE-CALL HOOK TESTS
+# APPLY GUARDRAIL — REQUEST PATH
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_allow(
-    lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_allow(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """When Lumia returns NONE, the request should pass through unchanged."""
+    """action=NONE leaves inputs unchanged."""
     with patch.object(
         lumia_guardrail.async_handler,
         "post",
         new=AsyncMock(return_value=_http_response({"action": "NONE"})),
     ):
-        result = await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=dual_cache,
-            data=sample_request_data,
-            call_type="completion",
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=sample_inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
-    assert result == sample_request_data
+    assert result["texts"] == sample_inputs["texts"]
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_blocked(
-    lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_blocked(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """When Lumia returns BLOCKED, an HTTPException(451) should be raised."""
-    blocked_response = _http_response(
+    """action=BLOCKED raises HTTPException(451) with the blocked_reason."""
+    blocked = _http_response(
         {"action": "BLOCKED", "blocked_reason": "Policy violation"}
     )
     with patch.object(
-        lumia_guardrail.async_handler,
-        "post",
-        new=AsyncMock(return_value=blocked_response),
+        lumia_guardrail.async_handler, "post", new=AsyncMock(return_value=blocked)
     ):
         with pytest.raises(HTTPException) as exc_info:
-            await lumia_guardrail.async_pre_call_hook(
-                user_api_key_dict=user_api_key_dict,
-                cache=dual_cache,
-                data=sample_request_data,
-                call_type="completion",
+            await lumia_guardrail.apply_guardrail(
+                inputs=sample_inputs,
+                request_data=sample_request_data,
+                input_type="request",
             )
     assert exc_info.value.status_code == 451
     assert "Policy violation" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_intervened_replaces_text(
-    lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_intervened_replaces_texts(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """GUARDRAIL_INTERVENED with texts should replace text content blocks."""
+    """Modified texts in the response replace inputs['texts'] in order.
+    LiteLLM's translation handler then maps these back into the original
+    provider-shape body — no splice work on our side."""
     intervened = _http_response(
         {
             "action": "GUARDRAIL_INTERVENED",
-            "texts": [
-                "[redacted system prompt]",
-                "[redacted user message]",
-            ],
+            "texts": ["[redacted system prompt]", "[redacted user message]"],
         }
     )
     with patch.object(
-        lumia_guardrail.async_handler,
-        "post",
-        new=AsyncMock(return_value=intervened),
+        lumia_guardrail.async_handler, "post", new=AsyncMock(return_value=intervened)
     ):
-        result = await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=dual_cache,
-            data=sample_request_data,
-            call_type="completion",
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=sample_inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
-    assert result["messages"][0]["content"] == "[redacted system prompt]"
-    assert result["messages"][1]["content"] == "[redacted user message]"
+    assert result["texts"] == [
+        "[redacted system prompt]",
+        "[redacted user message]",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_intervened_preserves_multimodal(
-    lumia_guardrail, user_api_key_dict, dual_cache, multimodal_request_data
+async def test_apply_guardrail_intervention_does_not_redact_images(
+    lumia_guardrail, sample_request_data
 ):
-    """Multi-modal messages keep their structure when intervened on."""
+    """Only text content is redactable. Images in inputs stay as-is even
+    if the API response includes an ``images`` field."""
+    original_images = ["data:image/png;base64,iVBORw0KGgoAAAA=="]
+    inputs = {
+        "texts": ["What's in this image?"],
+        "images": list(original_images),
+        "structured_messages": [],
+        "model": "gpt-4o",
+    }
     intervened = _http_response(
         {
             "action": "GUARDRAIL_INTERVENED",
@@ -340,194 +330,154 @@ async def test_pre_call_hook_intervened_preserves_multimodal(
         }
     )
     with patch.object(
-        lumia_guardrail.async_handler,
-        "post",
-        new=AsyncMock(return_value=intervened),
+        lumia_guardrail.async_handler, "post", new=AsyncMock(return_value=intervened)
     ):
-        result = await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=dual_cache,
-            data=multimodal_request_data,
-            call_type="completion",
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
-    content = result["messages"][0]["content"]
-    assert content[0]["type"] == "text"
-    assert content[0]["text"] == "[redacted question]"
-    assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,REDACTED"
+    assert result["texts"] == ["[redacted question]"]
+    assert result["images"] == original_images
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_fail_open_on_unreachable(
-    lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_fail_open_on_unreachable(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """Default fail_open: connection errors should let the request through."""
+    """Default fail_open: connection errors leave inputs unchanged."""
     with patch.object(
         lumia_guardrail.async_handler,
         "post",
         new=AsyncMock(side_effect=ConnectionError("connection refused")),
     ):
-        result = await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=dual_cache,
-            data=sample_request_data,
-            call_type="completion",
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=sample_inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
-    assert result == sample_request_data
+    assert result == sample_inputs
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_fail_closed_on_unreachable(
-    lumia_fail_closed, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_fail_closed_on_unreachable(
+    lumia_fail_closed, sample_inputs, sample_request_data
 ):
-    """fail_closed: connection errors must raise HTTPException(451)."""
+    """fail_closed: connection errors raise HTTPException(451)."""
     with patch.object(
         lumia_fail_closed.async_handler,
         "post",
         new=AsyncMock(side_effect=ConnectionError("connection refused")),
     ):
         with pytest.raises(HTTPException) as exc_info:
-            await lumia_fail_closed.async_pre_call_hook(
-                user_api_key_dict=user_api_key_dict,
-                cache=dual_cache,
-                data=sample_request_data,
-                call_type="completion",
+            await lumia_fail_closed.apply_guardrail(
+                inputs=sample_inputs,
+                request_data=sample_request_data,
+                input_type="request",
             )
     assert exc_info.value.status_code == 451
     assert "fail policy" in str(exc_info.value.detail).lower()
 
 
 @pytest.mark.asyncio
-async def test_pre_call_hook_non_200_response(
-    lumia_guardrail, user_api_key_dict, dual_cache, sample_request_data
+async def test_apply_guardrail_non_200_response(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """Non-200 response from Lumia should fail open (default)."""
+    """Non-200 response from Lumia falls back to fail_open default."""
     with patch.object(
         lumia_guardrail.async_handler,
         "post",
         new=AsyncMock(return_value=_http_response(status_code=500)),
     ):
-        result = await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=dual_cache,
-            data=sample_request_data,
-            call_type="completion",
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=sample_inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
-    assert result == sample_request_data
+    assert result == sample_inputs
 
 
 # =============================================================================
-# POST-CALL HOOK TESTS
+# APPLY GUARDRAIL — RESPONSE PATH
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_post_call_hook_returns_response_unchanged(
-    lumia_guardrail, user_api_key_dict, sample_request_data
+async def test_apply_guardrail_response_swallows_errors(
+    lumia_guardrail, sample_request_data
 ):
-    """post_call always returns the LLM response unchanged."""
-    mock_response = Mock()
-    mock_response.model_dump.return_value = {
-        "choices": [{"message": {"role": "assistant", "content": "Hello back!"}}]
-    }
-
-    with patch.object(
-        lumia_guardrail.async_handler,
-        "post",
-        new=AsyncMock(return_value=_http_response({"action": "NONE"})),
-    ):
-        result = await lumia_guardrail.async_post_call_success_hook(
-            data=sample_request_data,
-            user_api_key_dict=user_api_key_dict,
-            response=mock_response,
-        )
-    assert result is mock_response
-
-
-@pytest.mark.asyncio
-async def test_post_call_hook_swallows_errors(
-    lumia_guardrail, user_api_key_dict, sample_request_data
-):
-    """post_call must never raise - errors are logged only."""
-    mock_response = Mock()
-    mock_response.model_dump.return_value = {"choices": []}
-
+    """post-call (input_type='response') must not raise on transport
+    errors — Lumia is audit-only on the response side."""
+    inputs = {"texts": ["assistant text"], "model": "gpt-4o-mini"}
     with patch.object(
         lumia_guardrail.async_handler,
         "post",
         new=AsyncMock(side_effect=ConnectionError("boom")),
     ):
-        # Should not raise even if Lumia is unreachable
-        result = await lumia_guardrail.async_post_call_success_hook(
-            data=sample_request_data,
-            user_api_key_dict=user_api_key_dict,
-            response=mock_response,
+        result = await lumia_guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data=sample_request_data,
+            input_type="response",
         )
-    assert result is mock_response
+    assert result == inputs
 
 
 # =============================================================================
-# PAYLOAD CONSTRUCTION TESTS
+# PAYLOAD SHAPE
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_payload_includes_all_expected_fields(
-    lumia_guardrail, user_api_key_dict_full, dual_cache, sample_request_data
+async def test_payload_is_thin_envelope(
+    lumia_guardrail, sample_inputs, sample_request_data
 ):
-    """Verify the payload sent to Lumia contains all expected sections."""
+    """On-the-wire payload is a thin envelope — inputs + JSON-safe slice
+    of request_data, no filtering. Lumen owns identity / header /
+    traffic-event work."""
     captured = {}
 
     async def fake_post(url, content, headers, timeout):
+        import json as _json
+
         captured["url"] = url
-        captured["content"] = content
+        captured["payload"] = _json.loads(content)
         captured["headers"] = headers
         return _http_response({"action": "NONE"})
 
     with patch.object(lumia_guardrail.async_handler, "post", new=fake_post):
-        await lumia_guardrail.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict_full,
-            cache=dual_cache,
-            data=sample_request_data,
-            call_type="completion",
+        await lumia_guardrail.apply_guardrail(
+            inputs=sample_inputs,
+            request_data=sample_request_data,
+            input_type="request",
         )
 
-    import json as _json
+    payload = captured["payload"]
 
-    payload = _json.loads(captured["content"])
+    # Top-level envelope fields
+    assert payload["input_type"] == "request"
+    assert payload["litellm_version"]
 
-    # Body fields preserved at the top level (matches what per-vendor
-    # protocol definitions on the receiving side parse natively).
-    assert payload["model"] == "gpt-4o-mini"
-    assert payload["messages"] == sample_request_data["messages"]
-    assert payload["api_base"] == "https://api.openai.com/v1"
+    # Inputs forwarded as-is
+    assert payload["inputs"] == sample_inputs
 
-    # LiteLLM-internal/bookkeeping fields are stripped from the body.
-    assert "litellm_call_id" not in payload
-    assert "litellm_trace_id" not in payload
-    assert "metadata" not in payload
+    # request_metadata block has flattened identity + headers.
+    # proxy_server_request.headers wins over metadata.headers (it's the
+    # actual inbound HTTP envelope, more authoritative).
+    rm = payload["request_metadata"]
+    assert rm["request_data"]["user_api_key_user_email"] == "jane@company.com"
+    assert rm["request_headers"]["user-agent"] == "Cursor/0.50.16"
+    assert rm["request_headers"]["x-forwarded-for"] == "203.0.113.7"
 
-    # Lumia-specific metadata grouped under the _litellm envelope.
-    envelope = payload["_litellm"]
-    assert envelope["input_type"] == "request"
-    assert envelope["call_type"] == "completion"
-    assert envelope["api_base"] == "https://api.openai.com/v1"
-    assert envelope["request_data"]["user_api_key_user_id"] == "jane-user-id"
-    assert envelope["request_data"]["user_api_key_end_user_id"] == "end-user-789"
-    assert envelope["request_headers"]["user-agent"] == "Cursor/0.50.16"
-    assert envelope["litellm_call_id"] == "call-abc-123"
-    assert envelope["litellm_trace_id"] == "trace-xyz-789"
-
+    # Auth is via x-api-key
     assert captured["headers"]["x-api-key"] == "test-lumia-token"
 
 
 # =============================================================================
-# CONFIGURATION REGISTRATION TESTS
+# CONFIGURATION REGISTRATION
 # =============================================================================
 
 
 def test_init_guardrails_v2_registers_lumia(env_setup):
-    """Verify init_guardrails_v2 wires the Lumia guardrail correctly."""
     config = [
         {
             "guardrail_name": "lumia-from-config",
@@ -546,6 +496,5 @@ def test_init_guardrails_v2_registers_lumia(env_setup):
         config_file_path="",
     )
 
-    # The callback should be registered on litellm.callbacks
     callback_classes = [type(cb).__name__ for cb in litellm.callbacks]
     assert "LumiaGuardrail" in callback_classes

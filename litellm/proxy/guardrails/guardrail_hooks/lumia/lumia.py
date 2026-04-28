@@ -5,12 +5,12 @@
 #
 # +-------------------------------------------------------------+
 
+import json
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 from fastapi import HTTPException
 
-from litellm import DualCache
 from litellm._logging import verbose_proxy_logger
 from litellm._version import version as litellm_version
 from litellm.integrations.custom_guardrail import (
@@ -21,65 +21,44 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
 )
-from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.guardrails import GuardrailEventHooks
-from litellm.types.utils import LLMResponseTypes
+from litellm.types.utils import GenericGuardrailAPIInputs
 
 if TYPE_CHECKING:
-    pass
+    from litellm.litellm_core_utils.litellm_logging import (
+        Logging as LiteLLMLoggingObj,
+    )
 
 
 class LumiaGuardrailMissingSecrets(Exception):
-    """Raised when the Lumia API token is missing."""
-
     pass
 
 
-class LumiaGuardrailAPIError(Exception):
-    """Raised when calling the Lumia API fails and fail_closed is configured."""
-
-    pass
+_FORWARDED_REQUEST_METADATA_KEYS = ("metadata", "litellm_metadata")
 
 
-# Fields that exist in the LiteLLM hook ``data`` dict but are LiteLLM-internal
-# bookkeeping rather than parts of the original LLM API request body. These
-# are stripped before forwarding so the body that arrives at the Lumia API
-# matches what the upstream provider would see, plus a ``_litellm`` envelope
-# that carries Lumia-specific metadata.
-_EXCLUDE_FROM_BODY = frozenset(
-    {
-        "litellm_call_id",
-        "litellm_trace_id",
-        "litellm_metadata",
-        "litellm_logging_obj",
-        "litellm_params",
-        "metadata",
-        "proxy_server_request",
-        "provider_specific_header",
-        "secret_fields",
-    }
-)
+def _safe_string_headers(headers: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(headers, dict):
+        return None
+    out: Dict[str, str] = {}
+    for k, v in headers.items():
+        if isinstance(k, str) and isinstance(v, (str, int, float)):
+            out[k] = str(v)
+    return out or None
 
 
 class LumiaGuardrail(CustomGuardrail):
     """
     Lumia Security guardrail integration for LiteLLM.
 
-    Forwards each LLM request and response to a Lumia inspection endpoint, where
-    the customer's tenant policies determine whether the call should be allowed,
-    blocked, or modified. The guardrail preserves the natural LiteLLM payload
-    format - messages, tools, and multi-modal content are passed through as-is
-    so that Lumia's parsing pipeline receives the same structure regardless of
-    the underlying LLM provider.
-
-    Configuration is exposed through ``litellm_params`` in ``config.yaml``::
+    Configure via ``litellm_params`` in ``config.yaml``::
 
         guardrails:
           - guardrail_name: "lumia-guardrail"
             litellm_params:
               guardrail: lumia
               mode: ["pre_call", "post_call"]
-              api_base: https://guardrails.lumia.security
+              api_base: https://app.lumiasecurity.com
               api_key: os.environ/LUMIA_GUARDRAIL_API_KEY
               default_on: true
               timeout: 5
@@ -114,249 +93,112 @@ class LumiaGuardrail(CustomGuardrail):
         self.api_base = (
             api_base
             or os.environ.get("LUMIA_GUARDRAIL_API_BASE")
-            or "https://guardrails.lumia.security"
+            or "https://app.lumiasecurity.com"
         )
         self.api_base = self.api_base.rstrip("/")
 
         self.timeout = self._resolve_timeout(timeout)
         self.unreachable_fallback = self._resolve_fallback_action(unreachable_fallback)
 
-        supported_event_hooks = [
-            GuardrailEventHooks.pre_call,
-            GuardrailEventHooks.post_call,
-        ]
-
         super().__init__(
             guardrail_name=guardrail_name,
-            supported_event_hooks=supported_event_hooks,
+            supported_event_hooks=[
+                GuardrailEventHooks.pre_call,
+                GuardrailEventHooks.post_call,
+            ],
             **kwargs,
         )
 
-        verbose_proxy_logger.debug(
-            "Lumia Guardrail: initialized api_base=%s timeout=%ss fallback=%s",
-            self.api_base,
-            self.timeout,
-            self.unreachable_fallback,
-        )
-
-    # -------------------------------------------------------------------------
-    # Hook entry points
-    # -------------------------------------------------------------------------
-
     @log_guardrail_information
-    async def async_pre_call_hook(
+    async def apply_guardrail(
         self,
-        user_api_key_dict: UserAPIKeyAuth,
-        cache: DualCache,
-        data: dict,
-        call_type: Literal[
-            "completion",
-            "text_completion",
-            "embeddings",
-            "image_generation",
-            "moderation",
-            "audio_transcription",
-            "pass_through_endpoint",
-            "rerank",
-            "mcp_call",
-            "anthropic_messages",
-        ],
-    ) -> Optional[Union[Exception, str, dict]]:
-        """Run the Lumia guardrail before the LLM call. May block or modify the request."""
-        if (
-            self.should_run_guardrail(
-                data=data, event_type=GuardrailEventHooks.pre_call
-            )
-            is not True
-        ):
-            return data
-
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"] = None,
+    ) -> GenericGuardrailAPIInputs:
         payload = self._build_payload(
-            data=data,
-            user_api_key_dict=user_api_key_dict,
-            input_type="request",
-            call_type=str(call_type) if call_type is not None else None,
+            inputs=inputs,
+            request_data=request_data,
+            input_type=input_type,
+            logging_obj=logging_obj,
         )
 
-        lumia_response = await self._call_lumia_api(payload)
-        return self._apply_response_to_data(data=data, response=lumia_response)
-
-    @log_guardrail_information
-    async def async_post_call_success_hook(
-        self,
-        data: dict,
-        user_api_key_dict: UserAPIKeyAuth,
-        response: LLMResponseTypes,
-    ) -> LLMResponseTypes:
-        """Run the Lumia guardrail after the LLM call. Audit only - never blocks."""
-        if (
-            self.should_run_guardrail(
-                data=data, event_type=GuardrailEventHooks.post_call
-            )
-            is not True
-        ):
-            return response
-
-        try:
-            response_dict = (
-                response.model_dump() if hasattr(response, "model_dump") else {}  # type: ignore[union-attr]
-            )
-        except Exception as exc:  # noqa: BLE001
-            verbose_proxy_logger.debug(
-                "Lumia Guardrail: failed to dump response for post_call hook: %s", exc
-            )
-            response_dict = {}
-
-        payload = self._build_payload(
-            data=data,
-            user_api_key_dict=user_api_key_dict,
-            input_type="response",
-            call_type=None,
-            response=response_dict,
+        response = await self._call_lumia_api(
+            payload, raise_on_error=(input_type == "request")
         )
+        if response is None:
+            return inputs
 
-        try:
-            await self._call_lumia_api(payload, raise_on_error=False)
-        except Exception as exc:  # noqa: BLE001
-            # post_call is audit-only, never let it raise into the response path
-            verbose_proxy_logger.warning(
-                "Lumia Guardrail: post_call audit emission failed: %s", exc
-            )
-
-        return response
-
-    # -------------------------------------------------------------------------
-    # Payload construction
-    # -------------------------------------------------------------------------
+        return self._apply_response_to_inputs(inputs=inputs, response=response)
 
     def _build_payload(
         self,
-        data: dict,
-        user_api_key_dict: UserAPIKeyAuth,
-        input_type: str,
-        call_type: Optional[str],
-        response: Optional[dict] = None,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"],
     ) -> Dict[str, Any]:
-        """
-        Build the JSON payload sent to the Lumia API.
-
-        Preserves the original LLM API request body (``messages`` for
-        chat-completions, ``input`` for the Responses API, plus provider-
-        specific fields like Anthropic's ``system``, ``thinking``,
-        ``context_management``, etc.) at the top level so per-vendor protocol
-        definitions on the receiving side can parse them natively.
-
-        Lumia-specific metadata (identity, headers, LiteLLM call/trace IDs)
-        is grouped under a single ``_litellm`` envelope to keep it cleanly
-        separated from the upstream body.
-        """
-        request_body = {k: v for k, v in data.items() if k not in _EXCLUDE_FROM_BODY}
-
-        # For response events the top-level payload is the LLM response so the
-        # parser's response-side dissectors (``choices[].message.content`` for
-        # OpenAI, ``content[].text`` for Anthropic, etc.) match against the
-        # right shape. The original request body is preserved under the
-        # ``_litellm`` envelope so downstream consumers can correlate the two
-        # without a separate lookup.
-        #
-        # For request events the original behaviour stands: top-level is the
-        # request body so per-vendor request-side dissectors (``messages``,
-        # ``system``, ``tools``, ``input``, etc.) match natively.
-        if input_type == "response" and response is not None:
-            payload: Dict[str, Any] = dict(response)
-        else:
-            payload = dict(request_body)
-
-        envelope: Dict[str, Any] = {
-            "input_type": input_type,
-            "call_type": call_type,
-            "api_base": data.get("api_base"),
-            "request_data": self._extract_request_data(user_api_key_dict, data),
-            "request_headers": self._extract_headers(data),
-            "litellm_call_id": data.get("litellm_call_id"),
-            "litellm_trace_id": data.get("litellm_trace_id"),
-            "litellm_version": litellm_version,
-        }
-        if input_type == "response":
-            envelope["request_body"] = request_body
-        payload["_litellm"] = envelope
-
-        return payload
-
-    def _extract_request_data(
-        self, user_api_key_dict: UserAPIKeyAuth, data: dict
-    ) -> Dict[str, Optional[str]]:
-        """
-        Extract user/key context from the LiteLLM hook in the standard
-        ``request_data`` shape with ``user_api_key_*`` prefixes (matches the
-        convention used by LiteLLM's Generic Guardrail API and downstream
-        consumers in the LiteLLM ecosystem).
-        """
         return {
-            "user_api_key_hash": getattr(user_api_key_dict, "api_key", None),
-            "user_api_key_alias": getattr(user_api_key_dict, "key_alias", None),
-            "user_api_key_user_id": getattr(user_api_key_dict, "user_id", None),
-            "user_api_key_user_email": getattr(user_api_key_dict, "user_email", None),
-            "user_api_key_team_id": getattr(user_api_key_dict, "team_id", None),
-            "user_api_key_team_alias": getattr(user_api_key_dict, "team_alias", None),
-            "user_api_key_end_user_id": getattr(user_api_key_dict, "end_user_id", None),
-            "user_api_key_org_id": getattr(user_api_key_dict, "org_id", None),
-            "user": data.get("user"),
+            "input_type": input_type,
+            "litellm_call_id": (
+                getattr(logging_obj, "litellm_call_id", None)
+                if logging_obj
+                else request_data.get("litellm_call_id")
+            ),
+            "litellm_trace_id": (
+                getattr(logging_obj, "litellm_trace_id", None)
+                if logging_obj
+                else request_data.get("litellm_trace_id")
+            ),
+            "litellm_version": litellm_version,
+            "inputs": inputs,
+            "request_metadata": self._slice_request_metadata(request_data),
         }
 
-    def _extract_headers(self, data: dict) -> Dict[str, str]:
-        """
-        Extract original client headers forwarded by LiteLLM.
+    @staticmethod
+    def _slice_request_metadata(request_data: dict) -> Dict[str, Any]:
+        # Cherry-pick flat strings only — request_data can contain cycles
+        # on the streaming-response path (standard_logging_object →
+        # metadata → … → itself) which break ``json.dumps``.
+        result: Dict[str, Any] = {}
 
-        These come from the upstream HTTP request the client made to the LiteLLM
-        proxy and are useful for tool identification (User-Agent) and for
-        propagating customer-specific identity headers.
-        """
-        metadata = data.get("metadata") or {}
-        headers = metadata.get("headers") or {}
-
-        # LiteLLM also exposes proxy_server_request which contains the raw request
-        proxy_request = data.get("proxy_server_request") or {}
-        proxy_headers = proxy_request.get("headers") or {}
-
-        merged: Dict[str, str] = {}
-        for source in (proxy_headers, headers):
+        identity_block: Dict[str, str] = {}
+        for source_key in _FORWARDED_REQUEST_METADATA_KEYS:
+            source = request_data.get(source_key)
             if not isinstance(source, dict):
                 continue
-            for key, value in source.items():
-                if isinstance(key, str) and isinstance(value, (str, int, float)):
-                    merged[key.lower()] = str(value)
+            for k, v in source.items():
+                if not isinstance(k, str):
+                    continue
+                if k == "user" or k.startswith("user_api_key_"):
+                    if isinstance(v, (str, int, float)):
+                        identity_block[k] = str(v)
+        if identity_block:
+            result["request_data"] = identity_block
 
-        return merged
+        headers = _safe_string_headers(
+            (request_data.get("proxy_server_request") or {}).get("headers")
+        )
+        if not headers:
+            headers = _safe_string_headers(
+                (request_data.get("metadata") or {}).get("headers")
+            )
+        if headers:
+            result["request_headers"] = headers
 
-    # -------------------------------------------------------------------------
-    # HTTP call
-    # -------------------------------------------------------------------------
+        return result
 
     async def _call_lumia_api(
-        self, payload: Dict[str, Any], raise_on_error: bool = True
+        self, payload: Dict[str, Any], raise_on_error: bool
     ) -> Optional[Dict[str, Any]]:
-        """
-        POST the payload to the Lumia guardrail API and return the JSON response.
-
-        On failure, behavior depends on ``unreachable_fallback`` and ``raise_on_error``:
-        - ``raise_on_error=True`` and ``fail_closed`` -> raises HTTPException(503)
-        - ``raise_on_error=True`` and ``fail_open``   -> returns None (allow request)
-        - ``raise_on_error=False`` (post_call)        -> returns None on any error
-        """
-        import json
-
         url = f"{self.api_base}{self.GUARDRAIL_PATH}"
         headers = {
             "Content-Type": "application/json",
             "x-api-key": self.api_key or "",
         }
-
-        # Pre-serialize so we can pass ``default=str`` and survive any
-        # LiteLLM-internal objects (aiohttp ClientSession, custom callable
-        # references, etc.) that may slip through ``_EXCLUDE_FROM_BODY``.
-        # Without this, post-call payloads occasionally fail with
-        # ``Object of type ClientSession is not JSON serializable``.
+        # default=str so any non-JSON-native objects nested in
+        # request_metadata (Pydantic models, etc.) don't break the encoder.
         body = json.dumps(payload, default=str)
 
         try:
@@ -366,9 +208,9 @@ class LumiaGuardrail(CustomGuardrail):
                 headers=headers,
                 timeout=self.timeout,
             )
-        except Exception as exc:  # noqa: BLE001 - we want to catch all transport errors
+        except Exception as exc:  # noqa: BLE001
             verbose_proxy_logger.warning(
-                "Lumia Guardrail: failed to reach the Lumia API at %s: %s", url, exc
+                "Lumia Guardrail: failed to reach %s: %s", url, exc
             )
             if not raise_on_error:
                 return None
@@ -376,7 +218,7 @@ class LumiaGuardrail(CustomGuardrail):
 
         if response.status_code != 200:
             verbose_proxy_logger.warning(
-                "Lumia Guardrail: Lumia API returned non-200 status %s: %s",
+                "Lumia Guardrail: non-200 status %s: %s",
                 response.status_code,
                 response.text,
             )
@@ -388,65 +230,35 @@ class LumiaGuardrail(CustomGuardrail):
             return response.json()
         except Exception as exc:  # noqa: BLE001
             verbose_proxy_logger.warning(
-                "Lumia Guardrail: failed to parse Lumia API response as JSON: %s", exc
+                "Lumia Guardrail: failed to parse response: %s", exc
             )
             if not raise_on_error:
                 return None
             return self._handle_unreachable()
 
     def _handle_unreachable(self) -> Optional[Dict[str, Any]]:
-        """
-        Apply the configured fallback when the Lumia API is unreachable.
-
-        For ``fail_closed`` we surface HTTP 451 ("Unavailable For Legal
-        Reasons" — also widely used for "blocked by policy / external
-        authority") rather than 503. Clients (Cursor, OpenAI SDK, etc.)
-        treat 5xx as transient and retry with backoff, which produces a
-        retry storm during a Lumia outage. A 4xx surfaces the block once
-        and stops; 451 is distinguishable from a real 400 BadRequest so
-        operators can grep for it in logs.
-        """
+        # 451 (rather than 5xx) so clients don't retry-loop on a policy
+        # block or upstream outage.
         if self.unreachable_fallback == "fail_closed":
             raise HTTPException(
                 status_code=451,
                 detail={
-                    "error": "you were blocked by Lumia guardrail's default fail policy",
+                    "error": "Request blocked by Lumia guardrail default fail policy",
                     "guardrail_name": self.guardrail_name,
                 },
             )
-        # fail_open: signal to caller to allow the request through unchanged
         return None
 
-    # -------------------------------------------------------------------------
-    # Response handling
-    # -------------------------------------------------------------------------
-
-    def _apply_response_to_data(
-        self, data: dict, response: Optional[Dict[str, Any]]
-    ) -> dict:
-        """
-        Apply Lumia's decision to the request data.
-
-        Returns the (possibly mutated) data dict on allow / intervene.
-        Raises ``GuardrailRaisedException`` on block (LiteLLM maps to
-        HTTP 400 — non-retriable, consistent with the rest of the
-        LiteLLM guardrail ecosystem).
-        """
-        if response is None:
-            # fail_open path - allow through unchanged
-            return data
-
+    def _apply_response_to_inputs(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        response: Dict[str, Any],
+    ) -> GenericGuardrailAPIInputs:
         action = response.get("action", "NONE")
 
-        if action == "NONE":
-            return data
-
         if action == "BLOCKED":
-            blocked_reason = response.get(
-                "blocked_reason", "Request blocked by Lumia policy"
-            )
-            verbose_proxy_logger.info(
-                "Lumia Guardrail: blocking request - %s", blocked_reason
+            blocked_reason = (
+                response.get("blocked_reason") or "Request blocked by Lumia policy"
             )
             raise HTTPException(
                 status_code=451,
@@ -457,161 +269,28 @@ class LumiaGuardrail(CustomGuardrail):
                 },
             )
 
-        if action == "GUARDRAIL_INTERVENED":
-            modified_texts = response.get("texts") or []
-            modified_images = response.get("images") or []
-            verbose_proxy_logger.warning(
-                "Lumia Guardrail: applying intervention "
-                "(texts=%d, images=%d) — first text preview: %r",
-                len(modified_texts),
-                len(modified_images),
-                (modified_texts[0][:200] if modified_texts else None),
-            )
-            return self._apply_intervention(
-                data=data,
-                modified_texts=modified_texts,
-                modified_images=modified_images,
-            )
+        texts = response.get("texts")
+        if texts is not None:
+            inputs["texts"] = texts
 
-        verbose_proxy_logger.warning(
-            "Lumia Guardrail: unknown action '%s' in response, treating as NONE", action
-        )
-        return data
-
-    def _apply_intervention(  # noqa: PLR0915 - diagnostic logging makes this longer than the linter likes
-        self,
-        data: dict,
-        modified_texts: Optional[List[str]],
-        modified_images: Optional[List[str]],
-    ) -> dict:
-        """
-        Apply modified content from Lumia back into the request messages.
-
-        Replaces text and image content blocks in the messages array in order,
-        leaving the original message structure intact for any blocks that were
-        not modified. Matches the per-block convention used by LiteLLM's
-        Generic Guardrail API and other LiteLLM-ecosystem guardrail vendors.
-        """
-        if not modified_texts and not modified_images:
-            verbose_proxy_logger.warning(
-                "Lumia Guardrail: intervention skipped — both texts and images empty"
-            )
-            return data
-
-        messages = data.get("messages")
-        if not isinstance(messages, list):
-            verbose_proxy_logger.warning(
-                "Lumia Guardrail: intervention skipped — data['messages'] is not a list (got %s)",
-                type(messages).__name__,
-            )
-            return data
-
-        # Snapshot before-state for diagnostic visibility.
-        first_block_before: Optional[str] = None
-        for message in messages:
-            content = message.get("content")
-            if isinstance(content, str) and not first_block_before:
-                first_block_before = content[:200]
-                break
-            if isinstance(content, list):
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    ):
-                        first_block_before = block["text"][:200]
-                        break
-                if first_block_before:
-                    break
-
-        text_iter = iter(modified_texts or [])
-        image_iter = iter(modified_images or [])
-        texts_replaced = 0
-        images_replaced = 0
-        first_block_after: Optional[str] = None
-
-        for message in messages:
-            content = message.get("content")
-            if isinstance(content, str):
-                # Plain string content - replace with next modified text if any
-                next_text = next(text_iter, None)
-                if next_text is not None:
-                    message["content"] = next_text
-                    texts_replaced += 1
-                    if first_block_after is None:
-                        first_block_after = next_text[:200]
-            elif isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = block.get("type")
-                    if block_type == "text":
-                        next_text = next(text_iter, None)
-                        if next_text is not None:
-                            block["text"] = next_text
-                            texts_replaced += 1
-                            if first_block_after is None:
-                                first_block_after = next_text[:200]
-                    elif block_type == "image_url":
-                        next_image = next(image_iter, None)
-                        if next_image is not None:
-                            image_url = block.get("image_url")
-                            if isinstance(image_url, dict):
-                                image_url["url"] = next_image
-                            else:
-                                block["image_url"] = {"url": next_image}
-                            images_replaced += 1
-
-        verbose_proxy_logger.warning(
-            "Lumia Guardrail: intervention applied — texts replaced=%d/%d, "
-            "images replaced=%d/%d, messages count=%d. "
-            "First text block before=%r → after=%r",
-            texts_replaced,
-            len(modified_texts or []),
-            images_replaced,
-            len(modified_images or []),
-            len(messages),
-            first_block_before,
-            first_block_after,
-        )
-
-        return data
-
-    # -------------------------------------------------------------------------
-    # Configuration helpers
-    # -------------------------------------------------------------------------
+        return inputs
 
     def _resolve_timeout(self, timeout: Optional[float]) -> float:
         if timeout is not None:
             try:
                 return float(timeout)
             except (ValueError, TypeError):
-                verbose_proxy_logger.warning(
-                    "Lumia Guardrail: invalid timeout '%s', using default %ss",
-                    timeout,
-                    self.DEFAULT_TIMEOUT,
-                )
+                pass
         env_timeout = os.environ.get("LUMIA_GUARDRAIL_TIMEOUT")
         if env_timeout:
             try:
                 return float(env_timeout)
             except (ValueError, TypeError):
-                verbose_proxy_logger.warning(
-                    "Lumia Guardrail: invalid LUMIA_GUARDRAIL_TIMEOUT '%s', using default %ss",
-                    env_timeout,
-                    self.DEFAULT_TIMEOUT,
-                )
+                pass
         return self.DEFAULT_TIMEOUT
 
     def _resolve_fallback_action(self, action: Optional[str]) -> str:
         candidate = action or os.environ.get("LUMIA_GUARDRAIL_UNREACHABLE_FALLBACK")
         if candidate and candidate in self.SUPPORTED_FALLBACK_ACTIONS:
             return candidate
-        if candidate:
-            verbose_proxy_logger.warning(
-                "Lumia Guardrail: invalid unreachable_fallback '%s', using default '%s'",
-                candidate,
-                self.DEFAULT_FALLBACK_ACTION,
-            )
         return self.DEFAULT_FALLBACK_ACTION
