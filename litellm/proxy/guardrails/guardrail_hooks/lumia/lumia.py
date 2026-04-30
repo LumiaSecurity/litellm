@@ -237,14 +237,13 @@ class LumiaGuardrail(CustomGuardrail):
             return self._handle_unreachable()
 
     def _handle_unreachable(self) -> Optional[Dict[str, Any]]:
-        # 451 (rather than 5xx) so clients don't retry-loop on a policy
-        # block or upstream outage.
         if self.unreachable_fallback == "fail_closed":
             raise HTTPException(
-                status_code=451,
+                status_code=400,
                 detail={
                     "error": "Request blocked by Lumia guardrail default fail policy",
                     "guardrail_name": self.guardrail_name,
+                    "mode": "fail_closed",
                 },
             )
         return None
@@ -261,11 +260,12 @@ class LumiaGuardrail(CustomGuardrail):
                 response.get("blocked_reason") or "Request blocked by Lumia policy"
             )
             raise HTTPException(
-                status_code=451,
+                status_code=400,
                 detail={
                     "error": "Request blocked by Lumia guardrail",
                     "blocked_reason": blocked_reason,
                     "guardrail_name": self.guardrail_name,
+                    "mode": "block",
                 },
             )
 
