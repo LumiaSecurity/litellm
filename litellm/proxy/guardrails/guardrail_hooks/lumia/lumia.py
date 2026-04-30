@@ -17,6 +17,7 @@ from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     log_guardrail_information,
 )
+from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
@@ -32,19 +33,6 @@ if TYPE_CHECKING:
 
 class LumiaGuardrailMissingSecrets(Exception):
     pass
-
-
-_FORWARDED_REQUEST_METADATA_KEYS = ("metadata", "litellm_metadata")
-
-
-def _safe_string_headers(headers: Any) -> Optional[Dict[str, str]]:
-    if not isinstance(headers, dict):
-        return None
-    out: Dict[str, str] = {}
-    for k, v in headers.items():
-        if isinstance(k, str) and isinstance(v, (str, int, float)):
-            out[k] = str(v)
-    return out or None
 
 
 class LumiaGuardrail(CustomGuardrail):
@@ -139,55 +127,25 @@ class LumiaGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj: Optional["LiteLLMLoggingObj"],
     ) -> Dict[str, Any]:
+        # Forward LiteLLM's full surfaces verbatim:
+        #   - ``request_data``            — per-request dict (model, messages,
+        #                                   user_api_key_dict, metadata, IDs);
+        #                                   ``safe_dumps`` handles cycles + Pydantic.
+        #   - ``standard_logging_object`` — LiteLLM's curated observability
+        #                                   payload (response, costs, tokens,
+        #                                   timings, applied_guardrails). Already
+        #                                   JSON-safe by construction.
         return {
             "input_type": input_type,
-            "litellm_call_id": (
-                getattr(logging_obj, "litellm_call_id", None)
-                if logging_obj
-                else request_data.get("litellm_call_id")
-            ),
-            "litellm_trace_id": (
-                getattr(logging_obj, "litellm_trace_id", None)
-                if logging_obj
-                else request_data.get("litellm_trace_id")
-            ),
             "litellm_version": litellm_version,
             "inputs": inputs,
-            "request_metadata": self._slice_request_metadata(request_data),
+            "request_data": json.loads(safe_dumps(request_data)),
+            "standard_logging_object": (
+                logging_obj.standard_logging_object
+                if logging_obj and getattr(logging_obj, "standard_logging_object", None)
+                else None
+            ),
         }
-
-    @staticmethod
-    def _slice_request_metadata(request_data: dict) -> Dict[str, Any]:
-        # Cherry-pick flat strings only — request_data can contain cycles
-        # on the streaming-response path (standard_logging_object →
-        # metadata → … → itself) which break ``json.dumps``.
-        result: Dict[str, Any] = {}
-
-        identity_block: Dict[str, str] = {}
-        for source_key in _FORWARDED_REQUEST_METADATA_KEYS:
-            source = request_data.get(source_key)
-            if not isinstance(source, dict):
-                continue
-            for k, v in source.items():
-                if not isinstance(k, str):
-                    continue
-                if k == "user" or k.startswith("user_api_key_"):
-                    if isinstance(v, (str, int, float)):
-                        identity_block[k] = str(v)
-        if identity_block:
-            result["request_data"] = identity_block
-
-        headers = _safe_string_headers(
-            (request_data.get("proxy_server_request") or {}).get("headers")
-        )
-        if not headers:
-            headers = _safe_string_headers(
-                (request_data.get("metadata") or {}).get("headers")
-            )
-        if headers:
-            result["request_headers"] = headers
-
-        return result
 
     async def _call_lumia_api(
         self, payload: Dict[str, Any], raise_on_error: bool
@@ -197,8 +155,9 @@ class LumiaGuardrail(CustomGuardrail):
             "Content-Type": "application/json",
             "x-api-key": self.api_key or "",
         }
-        # default=str so any non-JSON-native objects nested in
-        # request_metadata (Pydantic models, etc.) don't break the encoder.
+        # ``request_data`` is already safe-dumped; ``standard_logging_object``
+        # is JSON-safe by construction. ``default=str`` is kept as a hedge in
+        # case something inside ``inputs`` ever surfaces a non-JSON-native value.
         body = json.dumps(payload, default=str)
 
         try:
