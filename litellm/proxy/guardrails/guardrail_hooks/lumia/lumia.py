@@ -87,6 +87,7 @@ class LumiaGuardrail(CustomGuardrail):
 
         self.timeout = self._resolve_timeout(timeout)
         self.unreachable_fallback = self._resolve_fallback_action(unreachable_fallback)
+        self.streaming_end_of_stream_only = True
 
         super().__init__(
             guardrail_name=guardrail_name,
@@ -127,14 +128,6 @@ class LumiaGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj: Optional["LiteLLMLoggingObj"],
     ) -> Dict[str, Any]:
-        # Forward LiteLLM's full surfaces verbatim:
-        #   - ``request_data``            — per-request dict (model, messages,
-        #                                   user_api_key_dict, metadata, IDs);
-        #                                   ``safe_dumps`` handles cycles + Pydantic.
-        #   - ``standard_logging_object`` — LiteLLM's curated observability
-        #                                   payload (response, costs, tokens,
-        #                                   timings, applied_guardrails). Already
-        #                                   JSON-safe by construction.
         return {
             "input_type": input_type,
             "litellm_version": litellm_version,
@@ -153,11 +146,9 @@ class LumiaGuardrail(CustomGuardrail):
         url = f"{self.api_base}{self.GUARDRAIL_PATH}"
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": self.api_key or "",
+            "Authorization": f"Bearer {self.api_key or ''}",
         }
-        # ``request_data`` is already safe-dumped; ``standard_logging_object``
-        # is JSON-safe by construction. ``default=str`` is kept as a hedge in
-        # case something inside ``inputs`` ever surfaces a non-JSON-native value.
+        
         body = json.dumps(payload, default=str)
 
         try:
@@ -228,9 +219,14 @@ class LumiaGuardrail(CustomGuardrail):
                 },
             )
 
-        texts = response.get("texts")
-        if texts is not None:
-            inputs["texts"] = texts
+        if action == "REDACT":
+            texts = response.get("texts")
+            if texts is not None:
+                inputs["texts"] = texts
+
+            structured = response.get("structured_messages")
+            if structured is not None:
+                inputs["structured_messages"] = structured
 
         return inputs
 
